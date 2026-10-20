@@ -3,15 +3,14 @@
 A RISC-V big.LITTLE / Unified-Memory SoC, built from scratch in SystemVerilog and
 verified with Verilator.
 
-This repository currently contains **Phase 0 and Phase 1 of the project: the
-E-Core** — a complete, compliance-passing, 100%-line-covered RV32I_Zicsr
-processor — together with the full multi-phase plan for the SoC that gets built
-around it.
+This repository contains the two cores and the big.LITTLE SoC built from them:
 
-> **Phase 2, the P-Core, is done and lives on the
-> [`docs/p-core-presentation`](https://github.com/Adithya010605/BigLittleSOC/tree/docs/p-core-presentation) branch**,
-> not on `main` yet. See [§1.1](#11-phase-2-the-p-core-on-branch-docsp-core-presentation)
-> for what it is and how it compares with the E-Core.
+* **E-Core** (Phase 1): a compliance-passing, 100%-line-covered RV32I_Zicsr
+  3-stage processor.
+* **P-Core** (Phase 2): RV32IM, 5-stage, with branch prediction (§1.1).
+* **The coherent 2P+2E SoC** (§1.2): private L1 caches kept coherent by MSI
+  snooping, a shared inclusive L2, a QoS interconnect, and a PMU that migrates
+  tasks between the clusters and manages power.
 
 The design target is a heterogeneous SoC in the shape of real Apple-Silicon-class
 parts: a small efficiency core and a wide performance core sharing one coherent
@@ -49,38 +48,34 @@ The short version of the build order, and where we are in it:
 |---|---|---|
 | 0 | Repo skeleton, build system, toolchain checks | **Done** |
 | 1 | **E-Core** — RV32I + Zicsr, 3-stage, machine mode | **Done, verified, synthesised** |
-| 2 | **P-Core** — RV32IM, 5-stage, branch prediction | **Done, verified, synthesised** — on branch `docs/p-core-presentation` |
-| 3 | UMA interconnect fabric (QoS NoC) | Not started |
-| 4 | Cache hierarchy + coherence | Not started |
-| 5 | ML accelerator + DMA | Not started |
-| 6 | Task migration controller + power management | Not started |
-| 7 | Integration, system verification, FPGA bring-up | Not started |
+| 2 | **P-Core** — RV32IM, 5-stage, branch prediction | **Done, verified, synthesised** |
+| 3 | Interconnect fabric (QoS crossbar to SRAM and peripherals) | **Done, verified** — §1.2 |
+| 4 | Cache hierarchy + MSI coherence (L1 I/D per core, shared inclusive L2) | **Done, verified** — §1.2 |
+| 5 | ML accelerator + DMA | Out of A1 scope (Project A2) |
+| 6 | Task migration controller + power management | **Done, verified** — §1.2 |
+| 7 | Integration and system verification | **Done in simulation**; SoC synthesis open; FPGA out of A1 scope |
 
-Everything in `rtl/`, `tb/`, `sw/`, `scripts/` and `syn/` on `main` is the
-E-Core. **The P-Core source is on the `docs/p-core-presentation` branch** (see
-§1.1). The caches, interconnect and accelerator are not written yet; that is
-the next chunk of work, and it is what the plan document is for.
+`rtl/common`, `rtl/e_core` and `rtl/p_core` are the cores; `rtl/cache`,
+`rtl/coherence`, `rtl/interconnect`, `rtl/periph`, `rtl/power` and `rtl/soc`
+are the SoC around them. One `make test` runs every core's and the SoC's gate.
 
 The E-Core is not a toy: it passes the official `rv32ui-p` compliance suite,
 runs 1,200 randomised programs in lockstep against a golden instruction-set
 simulator, survives mutation testing, hits 100% line coverage, and synthesises
 to 2,273 LUTs. The numbers in section 8 are all reproducible with `make test`.
 
-### 1.1 Phase 2: the P-Core (on branch `docs/p-core-presentation`)
+### 1.1 Phase 2: the P-Core
 
-The P-Core is the "big" core of the big.LITTLE pair. Its code is **not on
-`main` yet**; it is on the `docs/p-core-presentation` branch:
+The P-Core is the "big" core of the big.LITTLE pair:
 
 ```sh
-git fetch origin
-git checkout docs/p-core-presentation
 make CORE=p_core p-test     # the P-Core's full gate
-make test                   # both cores' gates + the E/P benchmark comparison
+make bench                  # the E/P benchmark comparison
 ```
 
-On that branch, `rtl/p_core/` holds the P-Core RTL, `tb/asm/p_core/` and
-`tb/unit/p_core/` its tests, and `docs/p_core_*.md` its microarchitecture,
-verification plan and results. `docs/p_core_panel_presentation.md` has every
+`rtl/p_core/` holds the P-Core RTL, `tb/asm/p_core/` and `tb/unit/p_core/`
+its tests, and `docs/p_core_*.md` its microarchitecture, verification plan and
+results. `docs/p_core_panel_presentation.md` has every
 feature, every result and the full E-Core/P-Core comparison. Every regression
 script takes `CORE=e_core|p_core`.
 
@@ -145,7 +140,7 @@ cycles ÷ P-Core cycles.
   not measured yet for either core (no place-and-route tool); it is the open
   question for FPGA bring-up.
 
-To reproduce the program comparison on the branch:
+To reproduce the program comparison:
 
 ```sh
 make sw-tests && make CORE=p_core sw-tests   # build and run the C programs on both cores
@@ -155,6 +150,61 @@ make bench                                   # prints the E-Core vs P-Core table
 There is no return-address stack yet, so a function called from several
 places mispredicts its return; that is why recursive `fib` gains only 1.02×,
 and a return-address stack is the obvious next improvement.
+
+### 1.2 Phases 3, 4 and 6: the coherent big.LITTLE SoC
+
+Two P-cores and two E-cores, each with private L1 instruction and data caches
+kept coherent by MSI snooping, a shared inclusive L2 with a snoop filter, a QoS
+crossbar to an RTL SRAM and peripherals, and a PMU that migrates tasks between
+the clusters and manages power. Full write-ups:
+[`docs/memory_system.md`](docs/memory_system.md) (caches, coherence, L2,
+interconnect) and [`docs/power_migration.md`](docs/power_migration.md) (task
+migration, sleep, clock gating, DVFS stub, power domains).
+
+## The SoC at a glance
+
+| Property | Value |
+|---|---|
+| Harts | 0–1 start on the P-cores, 2–3 on the E-cores (`mhartid`), one image for all; harts migrate between cores |
+| P-core L1I / L1D | 16 KB, 2-way, 32 B lines, LRU; L1D write-back / write-allocate, MSI |
+| E-core L1I / L1D | 8 KB, direct-mapped, 32 B lines; L1D write-through / no-write-allocate |
+| Instruction fetch | coherent with every core's stores (`FENCE.I` works behind the caches) |
+| L2 | 64 KB, 4-way, pseudo-LRU, write-back, inclusive; a sharer bit per L1 per line is the snoop filter; back-invalidation on eviction |
+| Coherence | MSI on an atomic snooping bus: BusRd, BusRdX (cache-to-cache), BusUpgr, write-through, writeback |
+| Interconnect | 4 × 6 crossbar, simplified AXI4-Lite, strict priority + round-robin + anti-starvation (16 cycles), QoS registers |
+| Slaves | SRAM 192 KB (1-cycle), UART, per-hart interrupt controller, system control (QoS, performance counters), PMU (power, migration) |
+| Migration | 39 items (x1–x31, pc, 7 CSRs) through the cores' halt/debug ports, 84 cycles; triggers: software, IPC monitor with hysteresis, P-core power budget |
+| Power | clock gating per core and per core's L1s, sleep / wake-on-interrupt, 1/1–1/2–1/4 divider per cluster, cluster power-off with L1 flush |
+| Memory model | sequentially consistent (each access performed at acknowledgement) |
+| Verification | every load checked against the coherent value in every SoC run, at every core speed; halted state checked against the golden ISS at random halts; 50/50 SoC mutations detected |
+
+**How it is verified** (all part of `make test`; latest gate log:
+[`docs/logs/make_test_2026-10-15_power.log`](docs/logs/make_test_2026-10-15_power.log)):
+
+| Gate | Result |
+|---|---|
+| Unit: coherence (`tb_coherent_mem`, `_small`, `_wb4`) | every MSI transition, both waiting-request races, L2 inclusion and back-invalidation, snoop filter, instruction-cache coherence, flush, slow cores; random traffic on all 8 ports, also with cores at 1/2, 1/4 and random speed and flushes mid-traffic |
+| Unit: interconnect (`tb_qos_xbar`) | every grant against a reference arbiter (priority, round-robin, anti-starvation, no dead cycles), routing, data, decode errors; 3.5M checks |
+| Each core behind the whole system (`make cached-tests`) | directed (incl. `fence_i`), `riscv-tests`, C programs, 600 × 2 random lockstep: all pass, same as the bare cores |
+| Multi-core programs (`make soc-tests`) | 20 programs × 6 settings (5 SRAM latencies + checked background traffic), including migration, sleep/wake, DVFS, power domains and automatic migration |
+| Halt/debug port (both cores, `--halt-every`) | directed suites, half the random lockstep programs and a quarter of the coverage replay run with random halts: halted state = golden ISS, debug writes read back; 100% line coverage kept |
+| Mutation (`make soc-mutation`) | 50 / 50 detected: caches, coherence, L2, interconnect, peripherals, slow-core hold and flush, PMU and migration |
+
+
+### P-core
+
+See `docs/p_core_verification_plan.md` and `docs/p_core_results.md` for the
+
+```sh
+make soc            # build the 2P+2E SoC simulator (build/soc_2p2e_sim)
+make soc-tests      # the multi-core programs in sw/soc_tests/
+make cached-tests   # every core suite again, behind the whole memory system
+make soc-mutation   # mutation testing of the memory system and the PMU
+make soc-test       # all three: the SoC's gate
+```
+
+`build/soc_2p2e_sim --elf=PROG.elf --stats` runs any multi-core program and
+prints per-cache, L2, bus, interconnect and per-core clock statistics.
 
 ---
 
@@ -201,16 +251,25 @@ BigLittleSOC/
 │
 ├── rtl/
 │   ├── common/                      ALU, regfile, imm gen, decoder, CSR unit, LSU, shared package
-│   └── e_core/                      pipeline stages, hazard unit, trap unit, top level
+│   ├── e_core/                      E-Core pipeline stages, hazard unit, trap unit, top level
+│   ├── p_core/                      P-Core pipeline, branch predictor, multiplier, divider
+│   ├── cache/                       L1 cache (MSI), L2 arrays, cache package
+│   ├── coherence/                   snooping bus + L2 controller, the coherent memory system
+│   ├── interconnect/                QoS crossbar
+│   ├── periph/                      SRAM controller, UART, interrupt controller, system control
+│   ├── power/                       PMU (migration + power management), clock gate
+│   └── soc/                         the 2P+2E SoC top level
 │
 ├── tb/
-│   ├── unit/                        one C++ Verilator harness per rtl/common module
+│   ├── unit/                        Verilator harnesses per module (common, p_core, coherence, interconnect)
 │   ├── integration/                 core harness, memory model, ELF loader, golden ISS, disassembler
+│   ├── soc/                         SoC harness with the coherence checker
 │   └── asm/                         hand-written self-checking assembly tests
 │
 ├── sw/
 │   ├── common/                      startup code (crt0, start.S), linker scripts, UART driver
-│   └── tests/                       C benchmark programs + expected output
+│   ├── tests/                       C benchmark programs + expected output
+│   └── soc_tests/                   multi-core programs (coherence, migration, power)
 │
 ├── scripts/                         build and regression drivers called by the Makefile
 ├── syn/                             Yosys synthesis script
@@ -322,6 +381,10 @@ RANDOM_NPROG=20 RANDOM_NSEED=1 make random
 | `make coverage` | coverage build + line/toggle report |
 | `make synth` | Yosys area estimate (fetches `sv2v` if needed) |
 | `make wave TEST=<name>` | rerun one test with tracing → `build/<name>.vcd` |
+| `make bench` | C programs on both cores + E/P comparison table |
+| `make soc` / `make soc-tests` / `make soc-test` | build the SoC / run its programs / its full gate (see §1.2) |
+| `make cached-tests` | both cores' suites behind the whole memory system |
+| `make soc-mutation` | mutation testing of caches, coherence, interconnect, PMU |
 | `make riscv-tests-fetch` | clone `third_party/riscv-tests` |
 | `make clean` | remove `build/` |
 | `make test` | **the acceptance gate** — everything above that matters |
@@ -520,6 +583,13 @@ Makefile edit.
 Full instruction encodings, the CSR map, trap priority and the top-level port
 list are in [`docs/E_CORE_REFERENCE.md`](docs/E_CORE_REFERENCE.md).
 
+**The SoC's memory map** (`rtl/soc/soc_top.sv`): SRAM `0x0000_0000`–`0x0002_FFFF`
+(cacheable), UART `0x1000_0000`, interrupt controller `0x1100_0000` (per hart
+at `+0x100 × hart`), system control `0x1200_0000`, PMU power registers
+`0x4000_0000`, PMU migration registers `0x5000_0000`; everything else faults.
+Register maps: [`docs/memory_system.md`](docs/memory_system.md) and
+[`docs/power_migration.md`](docs/power_migration.md).
+
 ---
 
 ## 10. Design decisions worth knowing
@@ -567,10 +637,10 @@ Then, by topic:
 | [`docs/e_core_results.md`](docs/e_core_results.md) | compliance pass table, CPI, stall breakdown, area estimate, methodology |
 | [`docs/lab_notebook.md`](docs/lab_notebook.md) | design decisions and debugging log, one entry per session, with the root cause of every bug found |
 
-The P-Core's documents (`docs/p_core_microarchitecture.md`,
-`docs/p_core_verification_plan.md`, `docs/p_core_results.md`,
-`docs/p_core_panel_presentation.md`) are on the `docs/p-core-presentation`
-branch; see §1.1.
+| [`docs/p_core_microarchitecture.md`](docs/p_core_microarchitecture.md), [`docs/p_core_verification_plan.md`](docs/p_core_verification_plan.md), [`docs/p_core_results.md`](docs/p_core_results.md) | the P-Core's design, verification and results |
+| [`docs/p_core_panel_presentation.md`](docs/p_core_panel_presentation.md) | every P-Core feature and result, and the full E-Core/P-Core comparison |
+| [`docs/memory_system.md`](docs/memory_system.md) | the caches, MSI coherence, the L2 and snoop filter, the interconnect, peripherals, their verification |
+| [`docs/power_migration.md`](docs/power_migration.md) | the PMU: task migration, sleep and wake, clock gating, DVFS stub, power domains, register map, verification |
 
 ---
 
@@ -619,15 +689,20 @@ you are probably running make from the wrong directory.
 
 ## 14. Roadmap
 
-**Phase 2, the P-Core, is complete** on the `docs/p-core-presentation` branch
-(§1.1), and merging it into `main` is the next step. It reused the E-Core's
-core-agnostic verification infrastructure (golden ISS, random generator,
-mutation harness, memory model) and its memory-port protocol, and it is
-measured against the E-Core's baseline in the comparison table in §1.1.
+Both cores, the coherent memory system, the interconnect and the PMU are
+done and verified in simulation (§1, §1.2). What is left for A1:
 
-Next, Phase 3 builds the interconnect that both cores plug into, and the
-project starts being a SoC rather than a processor. Full detail, including the
-timeline and risk analysis, in
+- **SoC synthesis.** The cache, L2 and SRAM arrays are written for simulation
+  (asynchronous reads, extra snoop/debug read ports) and must become
+  synchronous memories before the SoC can be synthesised.
+- **Boot ROM**, and a power demo that prints its P↔E decisions over UART.
+- **OS-level vs hardware task migration**, measured on the same SoC: this needs
+  a global timer (`mtime`), a PMU mode that leaves `mhartid` alone, and
+  ideally atomics (the A extension).
+- Optional: formal checks (SymbiYosys) of the MSI invariants and the migration
+  FSM.
+
+Full detail, including the timeline and risk analysis, in
 [`RISC-V_SoC_Project_Plan.md`](RISC-V_SoC_Project_Plan.md).
 
 ---

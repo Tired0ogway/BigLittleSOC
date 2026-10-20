@@ -1,19 +1,27 @@
 // ============================================================================
-// tb_e_core.cpp — Verilator harness for the E-Core.
+// tb_core.cpp — Verilator harness for either core.
 //
-// Drives rtl/e_core/e_core_top.sv against tb/integration/memory_model.*,
-// loading a program from an ELF file and terminating on the `tohost` store.
+// Drives rtl/e_core/e_core_top.sv or rtl/p_core/p_core_top.sv against
+// tb/integration/memory_model.*, loading a program from an ELF file and
+// terminating on the `tohost` store. Both cores have the same ports, so the
+// harness is the same; building with -DCORE_P selects the P-core, and with it
+// the golden ISS configuration (RV32IM, seven event counters) that matches.
 //
 // Usage:
-//   e_core_sim --elf=PROG.elf [options]
+//   e_core_sim | p_core_sim --elf=PROG.elf [options]
 //     --waits=0 | --waits=N | --waits=random[:SEED]
 //                          memory latency model (default 0)
+//     --dwaits=SPEC        override the data port's latency alone, same
+//                          syntax (e.g. --waits=0 --dwaits=3: fast fetch,
+//                          slow data)
 //     --max-cycles=N       timeout, default 1,000,000
 //     --trace=FILE.vcd     waveform dump (only in a --trace build)
 //     --log=FILE           per-instruction retirement trace
 //     --uart-out=FILE      capture UART output to a file as well as stdout
 //     --coverage-out=FILE  write coverage data (only in a --coverage build)
 //     --lockstep           compare against the golden ISS every retirement
+//     --halt-every=N[:SEED] halt the core through its debug port about every
+//                          N cycles (see HALT MODE below)
 //     --quiet              suppress the per-run summary line
 //
 // Exit status: 0 if the program signalled success through tohost, non-zero
@@ -36,9 +44,40 @@
 // a pure function of its own state and the request, and the core never derives
 // `req` combinationally from `gnt`. Both halves of that contract are stated in
 // memory_model.h and in the RTL header.
+//
+// ---------------------------------------------------------------------------
+// HALT MODE (--halt-every)
+// ---------------------------------------------------------------------------
+// The halt/debug port is what the PMU uses to migrate a context between
+// cores (rtl/power/pmu.sv). In halt mode the harness plays the PMU: at random
+// intervals it requests a halt and waits for halted_o, then
+//
+//   * reads x1..x31, the pc and the CSRs that travel with a context through
+//     the debug port and, under --lockstep, compares them with the golden
+//     ISS's architectural state at that point;
+//   * writes a random register, the pc and two CSRs with random values, reads
+//     each back, writes the original back and reads that back too;
+//   * stays halted a few cycles more, then releases the core.
+//
+// Now and then it withdraws the request before the core has halted, which
+// must simply let the core carry on. Since every write is undone, the
+// program runs exactly as it would have without the halts -- its own checks,
+// and the lockstep comparison, prove that the halts were invisible.
 // ============================================================================
 
+#ifdef CORE_P
+#include "Vp_core_top.h"
+using CoreTop = Vp_core_top;
+#define SIM_NAME "p_core_sim"
+constexpr bool kIssRv32m = true;
+constexpr int kIssNumHpm = 7;
+#else
 #include "Ve_core_top.h"
+using CoreTop = Ve_core_top;
+#define SIM_NAME "e_core_sim"
+constexpr bool kIssRv32m = false;
+constexpr int kIssNumHpm = 4;
+#endif
 #include "verilated.h"
 
 #if VM_TRACE
@@ -63,6 +102,7 @@ namespace {
 struct Options {
   std::string elf_path;
   std::string waits = "0";
+  std::string dwaits;
   std::string trace_path;
   std::string log_path;
   std::string uart_path;
@@ -70,6 +110,8 @@ struct Options {
   uint64_t max_cycles = 1000000;
   bool lockstep = false;
   bool quiet = false;
+  uint64_t halt_every = 0;     // 0: never
+  uint64_t halt_seed = 1;
 };
 
 bool StartsWith(const char* s, const char* prefix, const char** rest) {
@@ -91,6 +133,8 @@ bool ParseArgs(int argc, char** argv, Options* o, std::string* error) {
       o->elf_path = argv[++i];
     } else if (StartsWith(a, "--waits=", &v)) {
       o->waits = v;
+    } else if (StartsWith(a, "--dwaits=", &v)) {
+      o->dwaits = v;
     } else if (StartsWith(a, "--max-cycles=", &v)) {
       o->max_cycles = std::strtoull(v, nullptr, 0);
     } else if (StartsWith(a, "--trace=", &v)) {
@@ -105,6 +149,14 @@ bool ParseArgs(int argc, char** argv, Options* o, std::string* error) {
       o->coverage_path = v;
     } else if (std::strcmp(a, "--lockstep") == 0) {
       o->lockstep = true;
+    } else if (StartsWith(a, "--halt-every=", &v)) {
+      char* end = nullptr;
+      o->halt_every = std::strtoull(v, &end, 0);
+      if (end != nullptr && *end == ':') o->halt_seed = std::strtoull(end + 1, nullptr, 0);
+      if (o->halt_every == 0) {
+        *error = "--halt-every needs a positive interval";
+        return false;
+      }
     } else if (std::strcmp(a, "--quiet") == 0) {
       o->quiet = true;
     } else {
@@ -175,6 +227,201 @@ std::string FormatRetirement(const Retirement& r, const ElfImage& elf) {
   return std::string(buf);
 }
 
+// ---------------------------------------------------------------------------
+// Halt mode: the harness drives the core's halt and debug ports.
+// ---------------------------------------------------------------------------
+class HaltDriver {
+ public:
+  HaltDriver(uint64_t every, uint64_t seed) : every_(every), rng_(seed * 0x9E3779B97F4A7C15ull + 1) {
+    countdown_ = Draw(every_);
+  }
+
+  // Called once per cycle after the core's outputs have settled and before
+  // the clock edge: drives halt_req and the debug ports for this cycle.
+  // Returns an error message, or "" .
+  std::string Cycle(CoreTop* top, const GoldenIss* iss) {
+    // Every debug write lasts exactly one cycle.
+    top->dbg_rf_we_i = 0;
+    top->dbg_csr_we_i = 0;
+    top->dbg_pc_we_i = 0;
+    switch (phase_) {
+      case RUN:
+        if (countdown_-- == 0) {
+          phase_ = WAIT;
+          top->halt_req_i = 1;
+          waited_ = 0;
+          abort_at_ = (Next() % 8 == 0) ? static_cast<int>(Next() % 4) : -1;
+          ++requests_;
+        }
+        break;
+      case WAIT:
+        if (abort_at_ >= 0 && waited_ == static_cast<uint64_t>(abort_at_) && !top->halted_o) {
+          Release(top);
+          ++withdrawn_;
+          break;
+        }
+        if (top->halted_o) {
+          phase_ = HALTED;
+          ++halts_;
+          std::string e = Inspect(top, iss);
+          if (!e.empty()) return e;
+          Plan(top);
+        } else if (++waited_ > 5000) {
+          return "the core did not halt within 5000 cycles of the request";
+        }
+        break;
+      case HALTED: {
+        if (!top->halted_o) return "the core left the halted state while halt_req was high";
+        if (ops_.empty()) {
+          Release(top);
+          break;
+        }
+        const Op op = ops_.front();
+        ops_.pop_front();
+        std::string e = Do(top, op);
+        if (!e.empty()) return e;
+        break;
+      }
+    }
+    return "";
+  }
+
+  uint64_t halts() const { return halts_; }
+  uint64_t requests() const { return requests_; }
+  uint64_t withdrawn() const { return withdrawn_; }
+
+ private:
+  enum Phase { RUN, WAIT, HALTED };
+  enum Kind { RF_WRITE, RF_CHECK, CSR_WRITE, CSR_CHECK, PC_WRITE, PC_CHECK, IDLE };
+  struct Op {
+    Kind kind;
+    uint32_t addr;
+    uint32_t value;
+  };
+
+  static constexpr uint32_t kCsrs[7] = {0x300, 0x304, 0x305, 0x340, 0x341, 0x342, 0x343};
+
+  uint64_t Next() {
+    rng_ ^= rng_ << 13;
+    rng_ ^= rng_ >> 7;
+    rng_ ^= rng_ << 17;
+    return rng_;
+  }
+  uint64_t Draw(uint64_t mean) { return mean / 2 + Next() % (mean + 1); }
+
+  void Release(CoreTop* top) {
+    top->halt_req_i = 0;
+    phase_ = RUN;
+    countdown_ = Draw(every_);
+  }
+
+  static uint32_t ReadRf(CoreTop* top, int r) {
+    top->dbg_rf_addr_i = static_cast<uint8_t>(r);
+    top->eval();
+    return top->dbg_rf_rdata_o;
+  }
+  static uint32_t ReadCsr(CoreTop* top, uint32_t a) {
+    top->dbg_csr_addr_i = static_cast<uint16_t>(a);
+    top->eval();
+    return top->dbg_csr_rdata_o;
+  }
+
+  static std::string Mismatch(const char* what, uint32_t a, uint32_t got, uint32_t exp) {
+    char b[160];
+    std::snprintf(b, sizeof(b), "halted state: %s 0x%x reads 0x%08x, expected 0x%08x", what, a,
+                  got, exp);
+    return b;
+  }
+
+  // The architectural state, read through the debug port, against the ISS.
+  std::string Inspect(CoreTop* top, const GoldenIss* iss) {
+    for (int r = 1; r < 32; ++r) saved_x_[r] = ReadRf(top, r);
+    saved_pc_ = top->dbg_pc_o;
+    for (int k = 0; k < 7; ++k) saved_csr_[k] = ReadCsr(top, kCsrs[k]);
+    if (iss == nullptr) return "";
+    for (int r = 1; r < 32; ++r)
+      if (saved_x_[r] != iss->reg(r)) return Mismatch("x", static_cast<uint32_t>(r), saved_x_[r], iss->reg(r));
+    if (saved_pc_ != iss->pc()) return Mismatch("pc", 0, saved_pc_, iss->pc());
+    for (int k = 0; k < 7; ++k)
+      if (saved_csr_[k] != iss->csr(kCsrs[k])) return Mismatch("csr", kCsrs[k], saved_csr_[k], iss->csr(kCsrs[k]));
+    return "";
+  }
+
+  // Write, read back, restore, read back: one register, the pc, two CSRs.
+  void Plan(CoreTop* top) {
+    (void)top;
+    ops_.clear();
+    const uint32_t r = 1 + static_cast<uint32_t>(Next() % 31);
+    const uint32_t v = static_cast<uint32_t>(Next());
+    ops_.push_back({RF_WRITE, r, v});
+    ops_.push_back({RF_CHECK, r, v});
+    ops_.push_back({RF_WRITE, r, saved_x_[r]});
+    ops_.push_back({RF_CHECK, r, saved_x_[r]});
+    const uint32_t pc = static_cast<uint32_t>(Next()) & ~3u;
+    ops_.push_back({PC_WRITE, 0, pc});
+    ops_.push_back({PC_CHECK, 0, pc});
+    ops_.push_back({PC_WRITE, 0, saved_pc_});
+    ops_.push_back({PC_CHECK, 0, saved_pc_});
+    // mscratch and mtval hold any value
+    for (int k : {3, 6}) {
+      const uint32_t cv = static_cast<uint32_t>(Next());
+      ops_.push_back({CSR_WRITE, kCsrs[k], cv});
+      ops_.push_back({CSR_CHECK, kCsrs[k], cv});
+      ops_.push_back({CSR_WRITE, kCsrs[k], saved_csr_[k]});
+      ops_.push_back({CSR_CHECK, kCsrs[k], saved_csr_[k]});
+    }
+    for (uint64_t i = Next() % 6; i > 0; --i) ops_.push_back({IDLE, 0, 0});
+  }
+
+  std::string Do(CoreTop* top, const Op& op) {
+    switch (op.kind) {
+      case RF_WRITE:
+        top->dbg_rf_addr_i = static_cast<uint8_t>(op.addr);
+        top->dbg_wdata_i = op.value;
+        top->dbg_rf_we_i = 1;
+        break;
+      case RF_CHECK: {
+        const uint32_t got = ReadRf(top, static_cast<int>(op.addr));
+        if (got != op.value) return Mismatch("written x", op.addr, got, op.value);
+        break;
+      }
+      case CSR_WRITE:
+        top->dbg_csr_addr_i = static_cast<uint16_t>(op.addr);
+        top->dbg_wdata_i = op.value;
+        top->dbg_csr_we_i = 1;
+        break;
+      case CSR_CHECK: {
+        const uint32_t got = ReadCsr(top, op.addr);
+        if (got != op.value) return Mismatch("written csr", op.addr, got, op.value);
+        break;
+      }
+      case PC_WRITE:
+        top->dbg_wdata_i = op.value;
+        top->dbg_pc_we_i = 1;
+        break;
+      case PC_CHECK:
+        if (top->dbg_pc_o != op.value) return Mismatch("written pc", 0, top->dbg_pc_o, op.value);
+        break;
+      case IDLE:
+        break;
+    }
+    top->eval();
+    return "";
+  }
+
+  uint64_t every_;
+  uint64_t rng_;
+  uint64_t countdown_ = 0;
+  Phase phase_ = RUN;
+  uint64_t waited_ = 0;
+  int abort_at_ = -1;
+  std::deque<Op> ops_;
+  uint32_t saved_x_[32] = {};
+  uint32_t saved_pc_ = 0;
+  uint32_t saved_csr_[7] = {};
+  uint64_t halts_ = 0, requests_ = 0, withdrawn_ = 0;
+};
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -184,32 +431,42 @@ int main(int argc, char** argv) {
   Options opt;
   std::string err;
   if (!ParseArgs(argc, argv, &opt, &err)) {
-    std::fprintf(stderr, "e_core_sim: %s\n", err.c_str());
-    std::fprintf(stderr, "usage: e_core_sim --elf=PROG.elf [--waits=...] "
+    std::fprintf(stderr, SIM_NAME ": %s\n", err.c_str());
+    std::fprintf(stderr, "usage: " SIM_NAME " --elf=PROG.elf [--waits=...] "
                          "[--max-cycles=N] [--trace=F] [--log=F]\n");
     return 2;
   }
 
   ElfImage elf;
   if (!elf.Load(opt.elf_path, &err)) {
-    std::fprintf(stderr, "e_core_sim: %s\n", err.c_str());
+    std::fprintf(stderr, SIM_NAME ": %s\n", err.c_str());
     return 2;
   }
 
   WaitConfig wcfg;
   if (!WaitConfig::Parse(opt.waits, &wcfg, &err)) {
-    std::fprintf(stderr, "e_core_sim: %s\n", err.c_str());
+    std::fprintf(stderr, SIM_NAME ": %s\n", err.c_str());
     return 2;
   }
 
   MemoryModel mem;
   mem.SetWaits(wcfg);
+  if (!opt.dwaits.empty()) {
+    WaitConfig dcfg;
+    if (!WaitConfig::Parse(opt.dwaits, &dcfg, &err)) {
+      std::fprintf(stderr, SIM_NAME ": %s\n", err.c_str());
+      return 2;
+    }
+    mem.SetDataWaits(dcfg);
+    // Reported as "<fetch>/data=<data>" wherever the latency is printed.
+    wcfg.label_suffix = "/data=" + dcfg.Describe();
+  }
   if (!mem.LoadElf(elf, &err)) {
-    std::fprintf(stderr, "e_core_sim: %s\n", err.c_str());
+    std::fprintf(stderr, SIM_NAME ": %s\n", err.c_str());
     return 2;
   }
 
-  auto* top = new Ve_core_top;
+  auto* top = new CoreTop;
 
 #if VM_TRACE
   VerilatedVcdC* vcd = nullptr;
@@ -222,7 +479,7 @@ int main(int argc, char** argv) {
 #else
   if (!opt.trace_path.empty()) {
     std::fprintf(stderr,
-                 "e_core_sim: --trace given but this binary was built without "
+                 SIM_NAME ": --trace given but this binary was built without "
                  "tracing; use 'make wave TEST=<name>'\n");
     return 2;
   }
@@ -232,7 +489,7 @@ int main(int argc, char** argv) {
   if (!opt.log_path.empty()) {
     logf = std::fopen(opt.log_path.c_str(), "w");
     if (logf == nullptr) {
-      std::fprintf(stderr, "e_core_sim: cannot write %s\n", opt.log_path.c_str());
+      std::fprintf(stderr, SIM_NAME ": cannot write %s\n", opt.log_path.c_str());
       return 2;
     }
     std::fprintf(logf, "%8s %6s  %-10s  %-8s  %-28s %-24s%s\n", "cycle",
@@ -245,9 +502,10 @@ int main(int argc, char** argv) {
   // performance counters measure microarchitectural events that an
   // architectural model cannot predict.
   GoldenIss iss;
+  iss.Configure(kIssRv32m, kIssNumHpm);
   if (opt.lockstep) {
     if (!iss.Load(elf, &err)) {
-      std::fprintf(stderr, "e_core_sim: %s\n", err.c_str());
+      std::fprintf(stderr, SIM_NAME ": %s\n", err.c_str());
       return 2;
     }
   }
@@ -261,6 +519,8 @@ int main(int argc, char** argv) {
   bool timeout = false;
   bool halted = false;
   Retirement halt_rec;
+  HaltDriver halter(opt.halt_every, opt.halt_seed);
+  std::string halt_error;
 
   // ---- reset ----
   top->rst_ni = 0;
@@ -275,6 +535,14 @@ int main(int argc, char** argv) {
   top->irq_timer_i = 0;
   top->irq_software_i = 0;
   top->irq_external_i = 0;
+  top->hart_id_i = 0;
+  top->halt_req_i = 0;
+  top->dbg_rf_addr_i = 0;
+  top->dbg_rf_we_i = 0;
+  top->dbg_csr_addr_i = 0;
+  top->dbg_csr_we_i = 0;
+  top->dbg_pc_we_i = 0;
+  top->dbg_wdata_i = 0;
   top->clk_i = 0;
   for (int i = 0; i < 5; ++i) {
     top->clk_i = 0;
@@ -285,15 +553,21 @@ int main(int argc, char** argv) {
   top->rst_ni = 1;
 
   // ---- main loop ----
-  while (!mem.exited() && !halted) {
+  while (!mem.exited() && !halted && halt_error.empty()) {
     if (cycle >= opt.max_cycles) {
       timeout = true;
       break;
     }
 
-    // 1. settle the core's outputs for this cycle
+    // 1. settle the core's outputs for this cycle; in halt mode, drive the
+    //    halt and debug ports (the ISS is at the same architectural point:
+    //    every retirement so far has been stepped)
     top->clk_i = 0;
     top->eval();
+    if (opt.halt_every != 0) {
+      halt_error = halter.Cycle(top, opt.lockstep && lockstep_errors == 0 ? &iss : nullptr);
+      top->eval();
+    }
 
     // 2. the memory model responds
     MemRequest iq;
@@ -371,7 +645,7 @@ int main(int argc, char** argv) {
           if (got == exp) return;
           if (lockstep_errors++ > 0) return;
           std::fprintf(stderr,
-                       "\ne_core_sim: LOCKSTEP MISMATCH on %s\n"
+                       "\n" SIM_NAME ": LOCKSTEP MISMATCH on %s\n"
                        "  order      : %llu\n"
                        "  RTL  pc    : 0x%08x  insn 0x%08x  %s\n"
                        "  ISS  pc    : 0x%08x  insn 0x%08x  %s\n"
@@ -478,18 +752,25 @@ int main(int argc, char** argv) {
   };
 
   int rc = 0;
-  if (lockstep_errors > 0) {
+  if (!halt_error.empty()) {
+    std::fprintf(stderr, "\n" SIM_NAME ": HALT MODE: %s\n", halt_error.c_str());
+    dump_history("HALT MODE FAILURE");
+    rc = 5;
+  } else if (opt.halt_every != 0 && halter.halts() == 0 && cycle > 4 * opt.halt_every) {
+    std::fprintf(stderr, "\n" SIM_NAME ": HALT MODE: the core never halted\n");
+    rc = 5;
+  } else if (lockstep_errors > 0) {
     dump_history("LOCKSTEP MISMATCH");
     rc = 5;
   } else if (halted) {
     std::fprintf(stderr,
-                 "\ne_core_sim: CORE HALTED at pc=0x%08x insn=0x%08x (%s)\n",
+                 "\n" SIM_NAME ": CORE HALTED at pc=0x%08x insn=0x%08x (%s)\n",
                  halt_rec.pc, halt_rec.insn,
                  Disassemble(halt_rec.insn, halt_rec.pc).c_str());
     dump_history("CORE HALTED");
     rc = 3;
   } else if (timeout) {
-    std::fprintf(stderr, "\ne_core_sim: TIMEOUT after %llu cycles\n",
+    std::fprintf(stderr, "\n" SIM_NAME ": TIMEOUT after %llu cycles\n",
                  static_cast<unsigned long long>(cycle));
     dump_history("TIMEOUT");
     rc = 4;
@@ -500,7 +781,7 @@ int main(int argc, char** argv) {
     // 1 would call check 0 a pass and check 1 a failure, which is why the
     // comparison is against the raw word.
     std::fprintf(stderr,
-                 "\ne_core_sim: PROGRAM FAILED, tohost=%u (raw 0x%08x)\n",
+                 "\n" SIM_NAME ": PROGRAM FAILED, tohost=%u (raw 0x%08x)\n",
                  mem.exit_code(), mem.tohost_raw());
     std::fprintf(stderr,
                  "  The riscv-tests convention encodes a failing check n as "
@@ -511,13 +792,18 @@ int main(int argc, char** argv) {
   }
 
   if (!opt.quiet) {
-    std::printf("e_core_sim: %s  cycles=%llu instret=%llu traps=%llu waits=%s%s%s\n",
+    char halts[96] = "";
+    if (opt.halt_every != 0)
+      std::snprintf(halts, sizeof(halts), " halts=%llu/%llu",
+                    static_cast<unsigned long long>(halter.halts()),
+                    static_cast<unsigned long long>(halter.requests()));
+    std::printf(SIM_NAME ": %s  cycles=%llu instret=%llu traps=%llu waits=%s%s%s%s\n",
                 rc == 0 ? "PASS" : "FAIL",
                 static_cast<unsigned long long>(cycle),
                 static_cast<unsigned long long>(retired),
                 static_cast<unsigned long long>(trapped),
                 wcfg.Describe().c_str(),
-                opt.lockstep ? " lockstep=on" : "",
+                opt.lockstep ? " lockstep=on" : "", halts,
                 rc == 0 ? "" : "  <-- see stderr");
   }
 
